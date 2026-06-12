@@ -510,7 +510,8 @@ function macOnlyCard(id,name,ip,spec,color,dev){
             var nm=t.name||'';
             var st=t.status||'';
             var statusDot=st==='Up'?'🟢':st.indexOf('Exited')>=0?'🔴':'🟡';
-            h+='<div class="inf-row"><span class="inf-dev">'+devName+'</span><span class="inf-type" style="color:'+clr+'">'+(t.type==='container'?'📦':'⚙')+'</span><span class="inf-name">'+nm+'</span><span class="inf-status">'+(statusDot||'')+' '+st+'</span></div>';
+            var note=st==='Up'?'推理运行中':st.indexOf('Exited')>=0?'已停止':'状态异常';
+            h+='<div class="inf-row"><span class="inf-dev">'+devName+'</span><span class="inf-type" style="color:'+clr+'">'+(t.type==='container'?'📦':'⚙')+'</span><span class="inf-name">'+nm+'</span><span class="inf-status">'+statusDot+' '+note+'</span></div>';
         }
         return h;
     }
