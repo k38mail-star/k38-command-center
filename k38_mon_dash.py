@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""K38 Command Center v4 — 工业标准 · Prometheus /metrics · 多设备 · 告警"""
+"""K38 Command Center v0.5.0 — 全设备监控 · Prometheus /metrics · 多设备 · 网络 · 告警"""
 import subprocess, os, re, time, threading, json, signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -15,10 +15,14 @@ HOME = os.path.expanduser("~")
 D1 = "jager-dgx@192.168.3.55"
 D1_SSH = f"sshpass -p {PASS} ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {D1}"
 SSH_BASE = f"sshpass -p {PASS} ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {E2}"
+M38 = "jagerm3uitra@192.168.3.29"
+M4 = "jagerstudiom4max@192.168.3.46"
+M38_SSH = f"sshpass -p {PASS} ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {M38}"
+M4_SSH = f"sshpass -p {PASS} ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no {M4}"
 
 HISTORY = 150  # 5min @ 2s
 history = {k: deque(maxlen=HISTORY) for k in [
-    "mac_cpu","mac_mem","d1_gpu","d1_mem","d1_temp","d2_gpu","d2_mem","d2_temp"
+    "mac_cpu","mac_mem","d1_gpu","d1_mem","d1_temp","d2_gpu","d2_mem","d2_temp","m38_cpu","m38_mem","m4_cpu","m4_mem"
 ]}
 _ssubcribers = []  # SSE 客户端列表
 _lock = threading.Lock()
@@ -128,6 +132,46 @@ def collect():
             history["d2_temp"].append(float(d2["temp"]) if d2["temp"].isdigit() else 0)
     except: data["devices"]["d2"] = {"online": False}
 
+    # ── 三万八 ──
+    try:
+        raw38 = s(f"{M38_SSH} 'top -l 1 -n 0 | grep CPU'", to=4)
+        cpu38_pct = float(re.search(r'(\d+\.?\d*)%', raw38).group(1)) if raw38 and '%' in raw38 else 0.0
+        mem38_raw = s(f"{M38_SSH} 'vm_stat'", to=4)
+        pgsz38 = 16384; f38 = a38 = w38 = 0
+        for line in mem38_raw.split("\n"):
+            if "page size" in line: pgsz38 = int(re.search(r'(\d+)', line).group(1))
+            elif "Pages free" in line: f38 = int(re.search(r'(\d+)', line).group(1))
+            elif "Pages active" in line: a38 = int(re.search(r'(\d+)', line).group(1))
+            elif "Pages wired" in line: w38 = int(re.search(r'(\d+)', line).group(1))
+        mu38 = (a38 + w38) * pgsz38 / 1e9
+        mt38 = (f38 + a38 + w38) * pgsz38 / 1e9
+        data["devices"]["m38"] = {"cpu": cpu38_pct, "mem_used": mu38, "mem_total": mt38, "online": True}
+        with _lock:
+            history["m38_cpu"].append(cpu38_pct)
+            history["m38_mem"].append(mu38/mt38*100 if mt38 else 0)
+    except Exception as e:
+        data["devices"]["m38"] = {"online": False}
+
+    # ── 小四 ──
+    try:
+        raw4 = s(f"{M4_SSH} 'top -l 1 -n 0 | grep CPU'", to=4)
+        cpu4_pct = float(re.search(r'(\d+\.?\d*)%', raw4).group(1)) if raw4 and '%' in raw4 else 0.0
+        mem4_raw = s(f"{M4_SSH} 'vm_stat'", to=4)
+        pgsz4 = 16384; f4 = a4 = w4 = 0
+        for line in mem4_raw.split("\n"):
+            if "page size" in line: pgsz4 = int(re.search(r'(\d+)', line).group(1))
+            elif "Pages free" in line: f4 = int(re.search(r'(\d+)', line).group(1))
+            elif "Pages active" in line: a4 = int(re.search(r'(\d+)', line).group(1))
+            elif "Pages wired" in line: w4 = int(re.search(r'(\d+)', line).group(1))
+        mu4 = (a4 + w4) * pgsz4 / 1e9
+        mt4 = (f4 + a4 + w4) * pgsz4 / 1e9
+        data["devices"]["m4"] = {"cpu": cpu4_pct, "mem_used": mu4, "mem_total": mt4, "online": True}
+        with _lock:
+            history["m4_cpu"].append(cpu4_pct)
+            history["m4_mem"].append(mu4/mt4*100 if mt4 else 0)
+    except Exception as e:
+        data["devices"]["m4"] = {"online": False}
+
     # ── 200G ──
     try:
         po = s(f"""{D1_SSH} 'ping -c1 -W1 192.168.100.102 2>/dev/null | grep time=' """, to=3)
@@ -181,8 +225,65 @@ def collect():
     data["dl_real_speed"] = real_speed  # MB/s 真实速度
 
     # ── 推理 ──
-    proc = s(f"""{D1_SSH} 'ps aux | grep -E "inference.py|ralph" | grep -v grep' """, to=3).strip()
-    data["inference"] = proc if proc else None
+    # ── 公网ping（全设备，跳过离线）──
+    pub = {}; pub_all = {}
+    ping_src = [("大傻",D1_SSH,"ping"),("二傻",SSH_BASE,"ping"),("三万八",M38_SSH,"curl"),("小四",M4_SSH,"curl")]
+    for tag, host in [("baidu_ms","baidu.com"),("ytb_ms","youtube.com"),("github_ms","github.com"),("google_ms","google.com"),("yahoo_hk_ms","yahoo.com.hk")]:
+        best = None; details = {}
+        for sname, sp, meth in ping_src:
+            dk = {"大傻":"d1","二傻":"d2","三万八":"m38","小四":"m4"}.get(sname)
+            if dk and not data.get("devices",{}).get(dk,{}).get("online",False):
+                continue
+            try:
+                if meth == "ping":
+                    o = s(f"{sp} 'ping -c1 -W2 {host} 2>/dev/null | grep time=' ", to=3)
+                    m = re.search(r"time=([\d.]+)", o)
+                    v = float(m.group(1)) if m else None
+                else:
+                    o = s(f"{sp} 'curl -o /dev/null -s -w \"%{time_total}\" https://{host} --connect-timeout 3 --max-time 4' ", to=5)
+                    v = float(o.strip()) if o.strip() else None
+                    if v is not None: v = round(v * 1000, 1)
+                if v is not None:
+                    details[sname] = v
+                    if best is None or v < best: best = v
+            except:
+                pass
+        if best is not None: pub[tag] = best
+        if details: pub_all[tag] = details
+    data["public_ping"] = pub
+    data["public_ping_all"] = pub_all
+
+    # ── 推理任务（全设备，跳过离线+超时保护）──
+    inference_tasks = {"十六万":[]}
+    def _inf_one(sp, known_containers):
+        tasks = []
+        if known_containers:
+            out = s(f"{sp} 'docker ps --format \"{{{{.Names}}}}|{{{{.Status}}}}\" 2>/dev/null' ", to=2)
+            if out:
+                for line in out.strip().split("\n"):
+                    parts = line.split("|")
+                    n = (parts[0] or "").strip()
+                    if n in known_containers:
+                        st = (parts[1] or "").strip().split()[0] if len(parts) > 1 else ""
+                        tasks.append({"type":"container","name":n,"status":st})
+        return tasks
+    for dn,sp,kn in [["大傻",D1_SSH,None],["二傻",SSH_BASE,["echo2"]],["三万八",M38_SSH,None],["小四",M4_SSH,None]]:
+        dk = {"大傻":"d1","二傻":"d2","三万八":"m38","小四":"m4"}[dn]
+        if not data.get("devices",{}).get(dk,{}).get("online",False):
+            inference_tasks[dn] = []
+        else:
+            res = []
+            def _r():
+                try:
+                    t = _inf_one(sp, kn)
+                    res[:] = t if t else []
+                except:
+                    res[:] = []
+            th = threading.Thread(target=_r, daemon=True)
+            th.start()
+            th.join(timeout=4)
+            inference_tasks[dn] = res[:] if not th.is_alive() else []
+    data["inference_tasks"] = inference_tasks
 
     # ── 输出文件 ──
     fl = s(f"""{D1_SSH} 'find /home/jager-dgx/k38_output -name "*.mp4" -newer /tmp/k38_mon_watch -type f 2>/dev/null | head -6' """, to=3).strip()
@@ -230,6 +331,13 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 .gauge-label{font-size:9px;color:#556;margin-top:2px;text-transform:uppercase}
 .sparkline{opacity:.8}
 .alert-bar{display:flex;gap:6px;margin:6px 0;flex-wrap:wrap}
+.inf-row{display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid #111}
+.inf-row:last-child{border-bottom:none}
+.inf-dev{width:50px;color:#667;flex-shrink:0}
+.inf-type{font-size:10px;width:18px;text-align:center}
+.inf-name{flex:1;color:#aab}
+.inf-status{color:#667;font-size:9px}
+.inf-idle{color:#334;font-size:10px}
 .alert{font-size:10px;padding:3px 8px;border-radius:4px;font-weight:bold}
 .alert.warning{background:#330;color:#ff0;border:1px solid #660}
 .alert.critical{background:#300;color:#f44;border:1px solid #600}
@@ -257,7 +365,8 @@ canvas#bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;opacity:.
 <div id="inference"></div>
 <div id="downloads"></div>
 <div id="files"></div>
-<div class="meta">K38 Command Center v4 · polling · /api/v1/metrics · /metrics · /health</div>
+<div id="network"></div>
+<div class="meta">K38 Command Center v0.5.0 · polling · /api/v1/metrics · /metrics · /health</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -318,7 +427,11 @@ function devcard(id,name,ip,spec,color,dev){
 <div class="row" style="margin-top:4px;gap:6px">${sln(window["hist_"+id+"_gpu"]||[],color,130,18)}${sln(window["hist_"+id+"_temp"]||[],"#f80",130,18)}</div></div>`;
 }
 
-function render(d){
+function macOnlyCard(id,name,ip,spec,color,dev){
+    if(!dev.online)return'<div class="card" style="border-top:2px solid '+color+'"><div class="card-title" style="color:'+color+'">'+name+'</div><div style="color:#f44;font-size:12px">OFFLINE</div></div>';
+    var m=window["hist_"+id+"_cpu"]||[];m.push(dev.cpu||0);if(m.length>150)m=m.slice(-150);window["hist_"+id+"_cpu"]=m;
+    return'<div class="card" style="border-top:2px solid '+color+'"><div class="card-title" style="color:'+color+'">'+name+' <span style="color:#556;font-size:10px;font-weight:normal">'+spec+' &middot; '+ip+'</span></div><div class="row">'+sg("g_"+id,dev.cpu||0,100,"CPU",color,64)+'<div><div class="metric">CPU: <b>'+(dev.cpu||0).toFixed(0)+'%</b></div><div class="metric">内存: <b>'+(dev.mem_used||0).toFixed(0)+'</b>/'+(dev.mem_total||128).toFixed(0)+'GB</div></div></div><div style="margin-top:4px">'+sln(m,color,340,22)+'</div></div>';
+}
     $("clock").textContent=new Date(d.ts*1000).toLocaleTimeString("zh-CN",{hour12:false});
     // Alerts
     let ahtml="";
@@ -344,6 +457,8 @@ function render(d){
     dm+=`<div class="card" style="border-top:2px solid #0ff"><div class="card-title" style="color:#0ff">🖥 十六万 <span style="color:#556;font-size:10px;font-weight:normal">M3 Ultra 512GB · 192.168.3.47</span></div><div class="row">${sg("mc_cpu",mc.cpu||0,100,"CPU","#0ff",64)}<div><div class="metric">CPU: <b>${(mc.cpu||0).toFixed(0)}%</b></div><div class="metric">内存: <b>${(mc.mem_used||0).toFixed(0)}</b>/${(mc.mem_total||512).toFixed(0)}GB</div><div class="metric">磁盘: ${mc_disk} (${mc.disk_used||"?"}/${mc.disk_total||"?"})</div><div class="metric" style="font-size:9px;color:#445">${mc.gpu_info||"M3 Ultra"}</div></div></div><div style="margin-top:4px">${sln(mc_cpu,"#0ff",340,22)}</div></div>`;
     dm+=devcard("d1","🔥 大傻","192.168.3.55","DGX Spark", "#f0f", d1);
     dm+=devcard("d2","💧 二傻","192.168.3.45","DGX Spark", "#0fa", d2);
+    dm+=macOnlyCard("m38","三万八","192.168.3.29","M3 Ultra 96GB","#f80",d.devices.m38||{});
+    dm+=macOnlyCard("m4","小四","192.168.3.46","M4 Max 128GB","#07f",d.devices.m4||{});
     dm+="</div>";$("devices").innerHTML=dm;
 
     // 200G
@@ -352,10 +467,60 @@ function render(d){
     let lkt=lk.up?`${lk.latency.toFixed(2)}ms`:"DOWN";
     $("link200").innerHTML=`<div class="card" style="text-align:center;padding:6px"><span style="font-weight:bold;color:${lkc}">⚡ 200G直连: ${lkt}</span></div>`;
 
-    // Inference
-    $("inference").innerHTML=d.inference
-        ?`<div class="card" style="border-color:#f80"><div class="card-title" style="color:#f80">🔄 推理活跃</div><div class="metric" style="font-size:10px">${d.inference.replace(/</g,"&lt;").slice(0,200)}</div></div>`
-        :'<div class="card" style="border-color:#222;opacity:.4"><div class="card-title" style="color:#334">⏸ 无推理任务</div></div>';
+    // Network — 公网ping 矩阵
+    var pp=d.public_ping||{},ppa=d.public_ping_all||{};
+    var tags=["baidu_ms","ytb_ms","github_ms","google_ms","yahoo_hk_ms"];
+    var tagNames={"baidu_ms":"百度","ytb_ms":"YouTube","github_ms":"GitHub","google_ms":"Google","yahoo_hk_ms":"雅虎"};
+    var devOrderNW=["大傻","二傻","三万八","小四"];
+    var nwExpanded=window.nwExpanded||false;
+    function toggleNW(){window.nwExpanded=!window.nwExpanded;render(d)}
+    var nwHtml='<div class="card" style="border-color:#3a3a2a"><div class="card-title" style="color:#aa0">🌐 NETWORK LINKS</div><div class="row" style="flex-wrap:wrap;gap:4px;font-size:10px">';
+    for(var i=0;i<tags.length;i++){
+        var t=tags[i];
+        if(pp[t]!==undefined){
+            var clr=pp[t]<10?'#0f0':pp[t]<100?'#ff0':'#f80';
+            nwHtml+='<span style="color:'+clr+';cursor:pointer" onclick="toggleNW()">'+tagNames[t]+' '+pp[t].toFixed(0)+'ms</span>';
+            if(i<tags.length-1)nwHtml+=' | ';
+        }
+    }
+    nwHtml+='</div>';
+    if(window.nwExpanded){
+        nwHtml+='<div style="margin-top:4px;font-size:9px">';
+        for(var i=0;i<tags.length;i++){
+            var t=tags[i],det=ppa[t]||{};
+            for(var j=0;j<devOrderNW.length;j++){
+                var dn=devOrderNW[j],v=det[dn];
+                if(v!==undefined)nwHtml+='<div style="display:flex;padding:1px 4px"><span style="width:50px;color:#667">'+dn+'</span><span style="width:80px;color:#556">'+tagNames[t]+'</span><span style="color:'+(v<10?'#0f0':v<100?'#ff0':'#f80')+'">'+v.toFixed(0)+'ms</span></div>';
+            }
+        }
+        nwHtml+='</div>';
+    }
+    nwHtml+='</div>';
+    $("network").innerHTML=nwHtml;
+
+    // Inference — 精简化任务卡
+    var it=d.inference_tasks||{};
+    function inferCard(devName,tasks){
+        if(!tasks||tasks.length===0)
+            return'<div class="inf-row"><span class="inf-dev">'+devName+'</span><span class="inf-idle">⏸ 空闲</span></div>';
+        var h='';
+        for(var i=0;i<tasks.length;i++){
+            var t=tasks[i];
+            var clr=t.type==='container'?'#0f8':'#ff0';
+            var nm=t.name||'';
+            var st=t.status||'';
+            var statusDot=st==='Up'?'🟢':st.indexOf('Exited')>=0?'🔴':'🟡';
+            h+='<div class="inf-row"><span class="inf-dev">'+devName+'</span><span class="inf-type" style="color:'+clr+'">'+(t.type==='container'?'📦':'⚙')+'</span><span class="inf-name">'+nm+'</span><span class="inf-status">'+(statusDot||'')+' '+st+'</span></div>';
+        }
+        return h;
+    }
+    var infHtml='<div class="card" style="border-color:#3a2a0a"><div class="card-title" style="color:#fa0">🎯 INFERENCE</div>';
+    var devOrder=['二傻','大傻','十六万','三万八','小四'];
+    for(var i=0;i<devOrder.length;i++){
+        infHtml+=inferCard(devOrder[i],it[devOrder[i]]);
+    }
+    infHtml+='</div>';
+    $("inference").innerHTML=infHtml;
 
     // Downloads
     let dls=d.downloads||{};
@@ -388,7 +553,11 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/api/v1/metrics":
-            d = _cache.get("data") or collect()
+            d = _cache.get("data") if _cache else None
+            if d is None:
+                d = _cache.get("_bgdata", {}) if _cache else {}
+                if not d:
+                    d = {"ts":time.time(),"devices":{}}
             self._json(d)
         elif p == "/health":
             d = _cache.get("data", {})
@@ -491,10 +660,17 @@ START_TIME = time.time()
 
 def loop():
     global _cache
+    # 第一次同步采集确保立即有数据
+    try:
+        _cache = {"data": collect(), "ts": time.time(), "_bgdata": {}}
+    except Exception as e:
+        print(f"INIT COLLECT FAIL: {e}")
+        _cache = {"data": {"ts": time.time(), "devices": {}}, "ts": time.time(), "_bgdata": {}}
+    import sys; sys.stdout.flush()
     while True:
         try:
             d = collect()
-            _cache = {"data": d, "ts": time.time()}
+            _cache = {"data": d, "ts": time.time(), "_bgdata": d}
         except:
             pass
         time.sleep(2)
